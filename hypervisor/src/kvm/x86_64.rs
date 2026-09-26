@@ -504,13 +504,12 @@ impl KvmVm {
 
         let segment = metadata.ranges[0].segment;
         let bdf = metadata.ranges[0].bdf;
-        let pasid = metadata.ranges[0].pasid;
         let flags = u32::try_from(metadata.flags).map_err(|_| Error::new(EINVAL))?;
 
         if metadata
             .ranges
             .iter()
-            .any(|range| range.segment != segment || range.bdf != bdf || range.pasid != pasid)
+            .any(|range| range.segment != segment || range.bdf != bdf)
         {
             return Err(Error::new(EINVAL));
         }
@@ -524,7 +523,6 @@ impl KvmVm {
         let kvm_metadata = KvmProtectedVmPtdevMmioMetadata {
             segment,
             bdf,
-            pasid,
             nr_ranges: kvm_ranges.len() as u16,
             generation: metadata.generation,
             flags,
@@ -592,7 +590,6 @@ impl TryFrom<&ProtectedVmPtdevMmioRange> for KvmProtectedVmPtdevMmioRange {
 struct KvmProtectedVmPtdevMmioMetadata {
     segment: u16,
     bdf: u16,
-    pasid: u32,
     nr_ranges: u16,
     generation: u16,
     flags: u32,
