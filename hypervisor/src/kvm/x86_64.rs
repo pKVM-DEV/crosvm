@@ -509,9 +509,10 @@ impl KvmVm {
             .collect::<Result<Vec<_>>>()?;
 
         let kvm_metadata = KvmProtectedVmPtdevMmioMetadata {
-            nr_ranges: kvm_ranges.len() as u32,
+            segment: metadata.segment,
+            bdf: metadata.bdf,
+            nr_ranges: kvm_ranges.len() as u16,
             generation: metadata.generation,
-            reserved16: 0,
             flags: metadata.flags,
             ranges: kvm_ranges.as_ptr() as u64,
             reserved: [0; 4],
@@ -538,17 +539,13 @@ struct KvmProtectedVmInfo {
 
 #[repr(C)]
 struct KvmProtectedVmPtdevMmioRange {
-    segment: u16,
-    bdf: u16,
-    pasid: u32,
-    bar_index: u8,
-    reserved8: [u8; 3],
-    bar_offset: u64,
     guest_gpa: u64,
     size: u64,
-    kind: u32,
-    flags: u32,
-    reserved: [u64; 2],
+    bar_offset: u64,
+    bar_index: u8,
+    kind: u8,
+    reserved16: u16,
+    reserved32: u32,
 }
 
 impl TryFrom<&ProtectedVmPtdevMmioRange> for KvmProtectedVmPtdevMmioRange {
@@ -556,27 +553,24 @@ impl TryFrom<&ProtectedVmPtdevMmioRange> for KvmProtectedVmPtdevMmioRange {
 
     fn try_from(range: &ProtectedVmPtdevMmioRange) -> Result<Self> {
         Ok(Self {
-            segment: range.segment,
-            bdf: range.bdf,
-            pasid: range.pasid,
-            bar_index: range.bar_index,
-            reserved8: [0; 3],
-            bar_offset: range.bar_offset,
             guest_gpa: range.guest_gpa,
             size: range.size,
+            bar_offset: range.bar_offset,
+            bar_index: range.bar_index,
             kind: range.kind,
-            flags: range.flags,
-            reserved: [0; 2],
+            reserved16: 0,
+            reserved32: 0,
         })
     }
 }
 
 #[repr(C)]
 struct KvmProtectedVmPtdevMmioMetadata {
-    nr_ranges: u32,
+    segment: u16,
+    bdf: u16,
+    nr_ranges: u16,
     generation: u16,
-    reserved16: u16,
-    flags: u64,
+    flags: u32,
     ranges: u64,
     reserved: [u64; 4],
 }

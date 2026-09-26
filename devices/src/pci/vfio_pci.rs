@@ -1243,15 +1243,11 @@ impl VfioPciDevice {
 
             for mmap in mmaps {
                 ranges.push(ProtectedVmPtdevMmioRange {
-                    segment: 0,
-                    bdf: host_bdf,
-                    pasid: 0,
                     bar_index: u8::try_from(bar_index).context("BAR index overflow")?,
+                    kind: PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR,
                     bar_offset: mmap.offset,
                     guest_gpa: bar_addr + mmap.offset,
                     size: mmap.size,
-                    kind: PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR,
-                    flags: 0,
                 });
             }
         }
@@ -1269,6 +1265,8 @@ impl VfioPciDevice {
         }
 
         Ok(Some(ProtectedVmPtdevMmioMetadata {
+            segment: 0,
+            bdf: host_bdf,
             generation: 1,
             flags: 0,
             ranges,
