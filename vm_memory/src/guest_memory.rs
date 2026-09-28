@@ -367,6 +367,7 @@ impl GuestMemory {
                     .from_shared_memory(shm.as_ref())
                     .offset(shm_offset)
                     .align(range.2.align)
+                    .populate()
                     .build()
                     .map_err(Error::MemoryMappingFailed)?;
                 regions.push(MemoryRegion {
