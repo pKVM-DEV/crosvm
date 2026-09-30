@@ -1041,8 +1041,8 @@ impl arch::LinuxArch for X8664arch {
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
 
-        let use_pcie_cfg_mmio = !components.hv_cfg.protection_type.isolates_memory();
-        let use_pcie_vcfg_mmio = !components.hv_cfg.protection_type.isolates_memory();
+        let use_pcie_cfg_mmio = true;
+        let use_pcie_vcfg_mmio = true;
 
         let (pci, pci_irqs, mut pid_debug_label_map, amls, gpe_scope_amls) =
             arch::generate_pci_root(
