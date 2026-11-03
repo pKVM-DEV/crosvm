@@ -2599,6 +2599,10 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
         }
         HotPlugDeviceType::EndPoint => {
             let hotplug_key = HotPlugKey::HostVfio { host_addr };
+            let hotplug_bus = hp_bus
+                .lock()
+                .get_secondary_bus_number()
+                .context("selected hotplug port has no secondary bus")?;
             let (vfio_device, jail, viommu_mapper) = create_vfio_device(
                 cfg.jail_config.as_ref(),
                 &linux.vm,
@@ -2607,7 +2611,7 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 add_control_tube,
                 &device.path,
                 true,
-                None,
+                Some(hotplug_bus),
                 None,
                 None,
                 if iommu_host_tube.is_some() {
