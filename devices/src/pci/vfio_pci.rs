@@ -672,6 +672,8 @@ pub struct VfioPciDevice {
     config: VfioPciConfig,
     hotplug: bool,
     hotplug_bus_number: Option<u8>,
+    // Parent windows reserved at boot; exclusive to one protected endpoint.
+    protected_hotplug_windows: Option<[AddressRange; 2]>,
     preferred_address: PciAddress,
     pci_address: Option<PciAddress>,
     interrupt_evt: Option<IrqLevelEvent>,
@@ -859,6 +861,7 @@ impl VfioPciDevice {
             config,
             hotplug,
             hotplug_bus_number,
+            protected_hotplug_windows: None,
             preferred_address,
             pci_address: None,
             interrupt_evt: None,
@@ -1498,6 +1501,11 @@ impl VfioPciDevice {
         mem_bars
     }
 
+    /// Use the selected empty slot's reserved windows before publishing metadata.
+    pub fn set_protected_hotplug_windows(&mut self, windows: [AddressRange; 2]) {
+        self.protected_hotplug_windows = Some(windows);
+    }
+
     fn configure_barmem(&mut self, bar_info: &PciBarConfiguration, bar_addr: u64) {
         let offset: u32 = bar_info.reg_index() as u32 * 4;
         let mmio_region = *bar_info;
@@ -1641,9 +1649,28 @@ impl VfioPciDevice {
                 NON_PREFETCHABLE
             };
             let mut window_addr: u64 = 0;
-            // Don't allocate mmio for hotplug device, OS will allocate it from
-            // its parent's bridge window.
-            if !self.hotplug {
+            // Protected hotplug publishes final GPAs before guest enumeration.
+            // Other hotplug devices still let the guest allocate their BARs.
+            if let Some(windows) = self.protected_hotplug_windows {
+                let window = windows[i];
+                let mut allocator = VfioResourceAllocator::new(window)?;
+                window_addr = allocator.allocate_with_align(window_sz[i], alignment[i])?;
+                for mem_info in bars {
+                    let bar_addr = window_addr + mem_info.address();
+                    if !mem_info.is_64bit_memory()
+                        && bar_addr + mem_info.size() - 1 > u32::MAX as u64
+                    {
+                        return Err(PciDeviceError::PciBusWindowAllocationFailure(
+                            "32-bit protected BAR exceeds low MMIO".to_string(),
+                        ));
+                    }
+                    ranges.push(BarRange {
+                        addr: bar_addr,
+                        size: mem_info.size(),
+                        prefetchable: mem_info.is_prefetchable(),
+                    });
+                }
+            } else if !self.hotplug {
                 window_sz[i] = (window_sz[i] + 0xfffff) & !0xfffff;
                 let alloc = if i == NON_PREFETCHABLE {
                     Alloc::PciBridgeWindow {
@@ -2242,6 +2269,26 @@ mod tests {
     use resources::AddressRange;
 
     use super::VfioResourceAllocator;
+
+    #[test]
+    fn protected_hotplug_window_fits_large_gpu_bars() {
+        let base = 128u64 << 30;
+        let window = AddressRange::from_start_and_end(base, base + (64 << 30) - 1);
+        let mut allocator = VfioResourceAllocator::new(window).unwrap();
+        // A 32 GiB BAR followed by a 32 MiB BAR must fit and remain aligned.
+        let start = allocator
+            .allocate_with_align((32 << 30) + (32 << 20), 32 << 30)
+            .unwrap();
+        assert_eq!(start, base);
+        assert!(allocator.allocate_with_align(32 << 30, 32 << 30).is_err());
+    }
+
+    #[test]
+    fn protected_hotplug_window_rejects_undersized_slot() {
+        let window = AddressRange::from_start_and_end(0x8000_0000, 0x807f_ffff);
+        let mut allocator = VfioResourceAllocator::new(window).unwrap();
+        assert!(allocator.allocate_with_align(16 << 20, 16 << 20).is_err());
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

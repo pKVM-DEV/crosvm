@@ -1239,6 +1239,7 @@ fn create_pure_virtual_pcie_root_port(
     add_control_tube: &mut impl FnMut(AnyControlTube),
     devices: &mut Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
     hp_bus_count: u8,
+    protected: bool,
 ) -> Result<HotPlugStub> {
     let mut hp_sec_buses = Vec::new();
     let mut hp_stub = HotPlugStub::new();
@@ -1275,7 +1276,12 @@ fn create_pure_virtual_pcie_root_port(
         );
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
         add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
-        let pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
+        let mut pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
+        if protected {
+            // Address-space reservation, not RAM: fits the P40's 16 MiB BAR0
+            // and 32 GiB + 32 MiB prefetchable BARs before guest enumeration.
+            pci_bridge.set_hotplug_window_sizes(32 << 20, 64 << 30);
+        }
 
         hp_stub.iommu_bus_ranges.push(RangeInclusive::new(
             PciAddress {
@@ -2160,6 +2166,7 @@ where
         &mut add_control_tube,
         &mut devices,
         pci_hotplug_slots.unwrap_or(1),
+        cfg.protection_type.isolates_memory(),
     )?;
 
     arch::assign_pci_addresses(&mut devices, &mut sys_allocator)?;
@@ -2603,6 +2610,34 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 .lock()
                 .get_secondary_bus_number()
                 .context("selected hotplug port has no secondary bus")?;
+            let protected_windows = if cfg.protection_type.isolates_memory() {
+                let port = hp_bus.lock();
+                if !port.is_empty() {
+                    bail!("protected hotplug requires an empty slot");
+                }
+                let parent = port.get_address().context("hotplug port has no address")?;
+                let memory = sys_allocator
+                    .mmio_allocator_any()
+                    .get(&Alloc::PciBridgeWindow {
+                        bus: parent.bus,
+                        dev: parent.dev,
+                        func: parent.func,
+                    })
+                    .map(|(range, _)| *range)
+                    .context("hotplug port has no reserved memory window")?;
+                let prefetchable = sys_allocator
+                    .mmio_allocator_any()
+                    .get(&Alloc::PciBridgePrefetchWindow {
+                        bus: parent.bus,
+                        dev: parent.dev,
+                        func: parent.func,
+                    })
+                    .map(|(range, _)| *range)
+                    .context("hotplug port has no reserved prefetchable window")?;
+                Some([memory, prefetchable])
+            } else {
+                None
+            };
             let (vfio_device, jail, viommu_mapper) = create_vfio_device(
                 cfg.jail_config.as_ref(),
                 &linux.vm,
@@ -2622,10 +2657,13 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 None,
                 vfio_container_manager,
             )?;
-            let vfio_pci_device = match vfio_device {
+            let mut vfio_pci_device = match vfio_device {
                 VfioDeviceVariant::Pci(pci) => Box::new(pci),
                 VfioDeviceVariant::Platform(_) => bail!("vfio platform hotplug not supported"),
             };
+            if let Some(windows) = protected_windows {
+                vfio_pci_device.set_protected_hotplug_windows(windows);
+            }
             let pci_address = Arch::register_pci_device(
                 linux,
                 vfio_pci_device,
