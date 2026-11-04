@@ -2901,10 +2901,10 @@ fn remove_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 }
             }
 
-            // If all simbling downstream ports are empty, do not send hot unplug event for this
-            // downstream port. Root port will send one plug out interrupt and remove all
-            // the remaining devices
-            if !empty_simbling {
+            // A standalone root port has no parent hotplug key, so it must
+            // notify the guest itself. Switch ports can defer to their parent
+            // when all sibling ports are empty.
+            if !empty_simbling || hp_bus_lock.get_hotplug_key().is_none() {
                 hp_bus_lock.hot_unplug(pci_addr)?;
             }
 
