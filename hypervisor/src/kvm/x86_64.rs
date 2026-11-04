@@ -57,6 +57,7 @@ use crate::PitChannelState;
 use crate::PitState;
 use crate::ProtectedVmPtdevMmioMetadata;
 use crate::ProtectedVmPtdevMmioRange;
+use crate::ProtectedVmPtdevPciId;
 use crate::ProtectionType;
 use crate::Regs;
 use crate::Segment;
@@ -73,6 +74,8 @@ type KvmCpuId = FlexibleArrayWrapper<kvm_cpuid2, kvm_cpuid_entry2>;
 const KVM_XSAVE_MAX_SIZE: usize = 4096;
 const MSR_IA32_APICBASE: u32 = 0x0000001b;
 const KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_MMIO_METADATA: u32 = 2;
+const KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_PCI_ID: u32 = 3;
+const KVM_PROTECTED_VM_PTDEV_PCI_ID_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VcpuEvents {
@@ -490,6 +493,23 @@ impl KvmVm {
         }
     }
 
+    fn set_protected_vm_ptdev_pci_id(&self, id: &ProtectedVmPtdevPciId) -> Result<()> {
+        if id.host_segment != 0 {
+            return Err(Error::new(EINVAL));
+        }
+        let kvm_id = KvmProtectedVmPtdevPciId::from(id);
+
+        // SAFETY:
+        // kvm_id remains valid for the synchronous ioctl, which only reads this structure.
+        unsafe {
+            self.enable_raw_capability(
+                KvmCap::X86ProtectedVm,
+                KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_PCI_ID,
+                &[&kvm_id as *const KvmProtectedVmPtdevPciId as u64, 0, 0, 0],
+            )
+        }
+    }
+
     fn set_protected_vm_ptdev_mmio_metadata(
         &self,
         metadata: &ProtectedVmPtdevMmioMetadata,
@@ -597,6 +617,32 @@ struct KvmProtectedVmPtdevMmioMetadata {
     reserved: [u64; 4],
 }
 
+// Matches struct kvm_protected_vm_ptdev_pci_id in the pKVM UAPI.
+#[repr(C)]
+struct KvmProtectedVmPtdevPciId {
+    version: u32,
+    flags: u32,
+    host_segment: u16,
+    host_bdf: u16,
+    guest_segment: u16,
+    guest_bdf: u16,
+    reserved: [u32; 2],
+}
+
+impl From<&ProtectedVmPtdevPciId> for KvmProtectedVmPtdevPciId {
+    fn from(id: &ProtectedVmPtdevPciId) -> Self {
+        Self {
+            version: KVM_PROTECTED_VM_PTDEV_PCI_ID_VERSION,
+            flags: 0,
+            host_segment: id.host_segment,
+            host_bdf: id.host_bdf,
+            guest_segment: id.guest_segment,
+            guest_bdf: id.guest_bdf,
+            reserved: [0; 2],
+        }
+    }
+}
+
 impl VmX86_64 for KvmVm {
     fn get_hypervisor(&self) -> &dyn HypervisorX86_64 {
         &self.kvm
@@ -623,6 +669,10 @@ impl VmX86_64 for KvmVm {
         metadata: &ProtectedVmPtdevMmioMetadata,
     ) -> Result<()> {
         KvmVm::set_protected_vm_ptdev_mmio_metadata(self, metadata)
+    }
+
+    fn set_protected_vm_ptdev_pci_id(&self, id: &ProtectedVmPtdevPciId) -> Result<()> {
+        KvmVm::set_protected_vm_ptdev_pci_id(self, id)
     }
 
     fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuX86_64>> {
@@ -1901,6 +1951,32 @@ impl From<&DebugRegs> for kvm_debugregs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ptdev_pci_id_uapi_layout() {
+        assert_eq!(std::mem::size_of::<KvmProtectedVmPtdevPciId>(), 24);
+        assert_eq!(
+            std::mem::offset_of!(KvmProtectedVmPtdevPciId, host_segment),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(KvmProtectedVmPtdevPciId, guest_segment),
+            12
+        );
+        assert_eq!(std::mem::offset_of!(KvmProtectedVmPtdevPciId, reserved), 16);
+
+        let id = KvmProtectedVmPtdevPciId::from(&ProtectedVmPtdevPciId {
+            host_segment: 0,
+            host_bdf: 0x0200,
+            guest_segment: 7,
+            guest_bdf: 0x1bff,
+        });
+        assert_eq!(id.version, 1);
+        assert_eq!(id.flags, 0);
+        assert_eq!((id.host_segment, id.host_bdf), (0, 0x0200));
+        assert_eq!((id.guest_segment, id.guest_bdf), (7, 0x1bff));
+        assert_eq!(id.reserved, [0; 2]);
+    }
 
     #[test]
     fn vcpu_event_to_from() {

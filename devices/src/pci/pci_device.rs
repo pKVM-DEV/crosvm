@@ -18,6 +18,8 @@ use base::SharedMemory;
 #[cfg(target_arch = "x86_64")]
 use hypervisor::ProtectedVmPtdevMmioMetadata;
 #[cfg(target_arch = "x86_64")]
+use hypervisor::ProtectedVmPtdevPciId;
+#[cfg(target_arch = "x86_64")]
 use hypervisor::VmX86_64;
 use remain::sorted;
 use resources::Error as SystemAllocatorFaliure;
@@ -384,6 +386,12 @@ pub trait PciDevice: Send + Suspendable {
         &self,
         _vm: &dyn VmX86_64,
     ) -> anyhow::Result<Option<ProtectedVmPtdevMmioMetadata>> {
+        Ok(None)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Returns the host and allocated guest PCI addresses for a protected passthrough device.
+    fn get_protected_vm_ptdev_pci_id(&self) -> anyhow::Result<Option<ProtectedVmPtdevPciId>> {
         Ok(None)
     }
 

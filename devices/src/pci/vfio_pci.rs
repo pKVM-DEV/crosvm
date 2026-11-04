@@ -33,6 +33,8 @@ use hypervisor::MemCacheType;
 use hypervisor::ProtectedVmPtdevMmioMetadata;
 use hypervisor::ProtectedVmPtdevMmioRange;
 #[cfg(target_arch = "x86_64")]
+use hypervisor::ProtectedVmPtdevPciId;
+#[cfg(target_arch = "x86_64")]
 use hypervisor::VmX86_64;
 use hypervisor::PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR;
 use hypervisor::PROTECTED_VM_PTDEV_MMIO_MAX_RANGES;
@@ -696,6 +698,22 @@ pub struct VfioPciDevice {
     acpi_notifier_val: Arc<Mutex<Vec<u32>>>,
     gpe: Option<u32>,
     base_class_code: PciClassCode,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn protected_vm_ptdev_pci_id(
+    sysfs_path: &Path,
+    guest_address: Option<PciAddress>,
+) -> anyhow::Result<ProtectedVmPtdevPciId> {
+    // PciAddress rejects non-zero PCI domains rather than silently discarding them.
+    let host = PciAddress::from_path(sysfs_path).context("failed to parse host PCI address")?;
+    let guest = guest_address.context("passthrough device has no allocated guest PCI address")?;
+    Ok(ProtectedVmPtdevPciId {
+        host_segment: 0,
+        host_bdf: host.to_u32() as u16,
+        guest_segment: 0,
+        guest_bdf: guest.to_u32() as u16,
+    })
 }
 
 impl VfioPciDevice {
@@ -1878,6 +1896,14 @@ impl PciDevice for VfioPciDevice {
         self.build_protected_vm_ptdev_mmio_metadata()
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn get_protected_vm_ptdev_pci_id(&self) -> anyhow::Result<Option<ProtectedVmPtdevPciId>> {
+        if !self.submit_ptdev_mmio_metadata {
+            return Ok(None);
+        }
+        protected_vm_ptdev_pci_id(&self.sysfs_path, self.pci_address).map(Some)
+    }
+
     fn read_config_register(&self, reg_idx: usize) -> u32 {
         let reg: u32 = (reg_idx * 4) as u32;
         let mut config: u32 = self.config.read_config(reg);
@@ -2216,6 +2242,40 @@ mod tests {
     use resources::AddressRange;
 
     use super::VfioResourceAllocator;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ptdev_pci_id_uses_allocated_guest_address() {
+        let id = super::protected_vm_ptdev_pci_id(
+            std::path::Path::new("/sys/bus/pci/devices/0000:02:00.0"),
+            Some(super::PciAddress::new(0, 0x1b, 0x1f, 7).unwrap()),
+        )
+        .unwrap();
+        assert_eq!((id.host_segment, id.host_bdf), (0, 0x0200));
+        assert_eq!((id.guest_segment, id.guest_bdf), (0, 0x1bff));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ptdev_pci_id_rejects_missing_guest_address() {
+        assert!(super::protected_vm_ptdev_pci_id(
+            std::path::Path::new("/sys/bus/pci/devices/0000:02:00.0"),
+            None,
+        )
+        .is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ptdev_pci_id_rejects_invalid_host_address() {
+        let guest = Some(super::PciAddress::new(0, 0, 1, 0).unwrap());
+        for path in [
+            "/sys/bus/pci/devices/0001:02:00.0",
+            "/sys/bus/pci/devices/invalid",
+        ] {
+            assert!(super::protected_vm_ptdev_pci_id(std::path::Path::new(path), guest).is_err());
+        }
+    }
 
     #[test]
     fn no_overlap() {

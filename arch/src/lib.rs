@@ -749,6 +749,10 @@ pub enum DeviceRegistrationError {
     /// Failed to derive protected-VM passthrough MMIO metadata from a PCI device.
     #[error("failed to derive protected VM ptdev MMIO metadata: {0}")]
     RegisterProtectedVmPtdevMmioMetadata(anyhow::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to obtain the host and guest PCI addresses of a protected passthrough device.
+    #[error("failed to derive protected VM ptdev PCI identity: {0}")]
+    RegisterProtectedVmPtdevPciId(anyhow::Error),
     /// Could not setup VFIO platform IRQ for the device.
     #[error("Setting up VFIO platform IRQ: {0}")]
     SetupVfioPlatformIrq(anyhow::Error),
@@ -756,10 +760,14 @@ pub enum DeviceRegistrationError {
     /// Failed to submit protected-VM passthrough MMIO metadata to the hypervisor.
     #[error("failed to submit protected VM ptdev MMIO metadata: {0}")]
     SubmitProtectedVmPtdevMmioMetadata(base::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to register a protected passthrough device's guest PCI address.
+    #[error("failed to submit protected VM ptdev PCI identity: {0}")]
+    SubmitProtectedVmPtdevPciId(base::Error),
 }
 
 #[cfg(target_arch = "x86_64")]
-fn submit_protected_vm_ptdev_mmio_metadata(
+fn submit_protected_vm_ptdev_metadata(
     device: &dyn PciDevice,
     vm: &impl VmArch,
 ) -> Result<(), DeviceRegistrationError> {
@@ -769,6 +777,13 @@ fn submit_protected_vm_ptdev_mmio_metadata(
     {
         vm.set_protected_vm_ptdev_mmio_metadata(&metadata)
             .map_err(DeviceRegistrationError::SubmitProtectedVmPtdevMmioMetadata)?;
+        if let Some(id) = device
+            .get_protected_vm_ptdev_pci_id()
+            .map_err(DeviceRegistrationError::RegisterProtectedVmPtdevPciId)?
+        {
+            vm.set_protected_vm_ptdev_pci_id(&id)
+                .map_err(DeviceRegistrationError::SubmitProtectedVmPtdevPciId)?;
+        }
     }
 
     Ok(())
@@ -799,7 +814,7 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
         .map_err(DeviceRegistrationError::AllocateDeviceAddrs)?;
 
     #[cfg(target_arch = "x86_64")]
-    submit_protected_vm_ptdev_mmio_metadata(device.as_ref(), &linux.vm)?;
+    submit_protected_vm_ptdev_metadata(device.as_ref(), &linux.vm)?;
 
     // If device is a pcie bridge, add its pci bus to pci root
     if let Some(pci_bus) = device.get_new_pci_bus() {
@@ -1252,7 +1267,7 @@ pub fn generate_pci_root(
         let ranges = io_ranges.remove(&dev_idx).unwrap_or_default();
         let device_ranges = device_ranges.remove(&dev_idx).unwrap_or_default();
         #[cfg(target_arch = "x86_64")]
-        submit_protected_vm_ptdev_mmio_metadata(device.as_ref(), &*vm)?;
+        submit_protected_vm_ptdev_metadata(device.as_ref(), &*vm)?;
         device
             .register_device_capabilities()
             .map_err(DeviceRegistrationError::RegisterDeviceCapabilities)?;

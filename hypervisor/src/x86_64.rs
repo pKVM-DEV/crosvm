@@ -53,6 +53,15 @@ pub struct ProtectedVmPtdevMmioMetadata {
     pub ranges: Vec<ProtectedVmPtdevMmioRange>,
 }
 
+/// Host and guest PCI addresses for an assigned protected-VM passthrough device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtectedVmPtdevPciId {
+    pub host_segment: u16,
+    pub host_bdf: u16,
+    pub guest_segment: u16,
+    pub guest_bdf: u16,
+}
+
 const MSR_F15H_PERF_CTL0: u32 = 0xc0010200;
 const MSR_F15H_PERF_CTL1: u32 = 0xc0010202;
 const MSR_F15H_PERF_CTL2: u32 = 0xc0010204;
@@ -95,6 +104,11 @@ pub trait VmX86_64: Vm {
     /// Only works on protected VMs (i.e. those with vm_type == KVM_X86_PKVM_PROTECTED_VM).
     fn load_protected_vm_firmware(&mut self, fw_addr: GuestAddress, fw_max_size: u64)
         -> Result<()>;
+
+    /// Register the guest PCI address of an already assigned passthrough device.
+    fn set_protected_vm_ptdev_pci_id(&self, _id: &ProtectedVmPtdevPciId) -> Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+    }
 
     /// Submit passthrough-device MMIO metadata for protected pVM BAR allowlisting.
     fn set_protected_vm_ptdev_mmio_metadata(
