@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::BTreeSet;
 use std::convert::TryFrom;
 use std::mem;
 use std::result;
@@ -25,6 +26,8 @@ pub enum Error {
     /// Failure while zeroing out the memory for the MP table.
     #[error("Failure while zeroing out the memory for the MP table")]
     Clear,
+    #[error("all 256 PCI bus IDs are used; no MP bus ID remains for ISA")]
+    NoFreeIsaBusId,
     /// There was too little guest memory to store the entire MP table.
     #[error("There was too little guest memory to store the MP table")]
     NotEnoughMemory,
@@ -70,6 +73,7 @@ const CPU_STEPPING: u32 = 0x600;
 const CPU_FEATURE_APIC: u32 = 0x200;
 const CPU_FEATURE_FPU: u32 = 0x001;
 const MPTABLE_START: u64 = 0x400 * 639; // Last 1k of Linux's 640k base RAM.
+const MPTABLE_END: u64 = super::LOW_MEMORY_END; // Exclusive end of low RAM.
 
 fn compute_checksum<T: AsBytes>(v: &T) -> u8 {
     let mut checksum: u8 = 0;
@@ -84,15 +88,34 @@ fn mpf_intel_compute_checksum(v: &mpf_intel) -> u8 {
     (!checksum).wrapping_add(1)
 }
 
-fn compute_mp_size(num_cpus: u8) -> usize {
+fn compute_mp_size(
+    num_cpus: u8,
+    pci_bus_count: usize,
+    pci_irq_count: usize,
+    isa_irq_count: usize,
+) -> usize {
     mem::size_of::<mpf_intel>()
         + mem::size_of::<mpc_table>()
         + mem::size_of::<mpc_cpu>() * (num_cpus as usize)
         + mem::size_of::<mpc_ioapic>()
-        + mem::size_of::<mpc_bus>() * 2
+        + mem::size_of::<mpc_bus>() * (pci_bus_count + 1)
         + mem::size_of::<mpc_intsrc>()
-        + mem::size_of::<mpc_intsrc>() * 16
+        + mem::size_of::<mpc_intsrc>()
+            * (super::X86_64_SCI_IRQ as usize + 2 + pci_irq_count + isa_irq_count)
         + mem::size_of::<mpc_lintsrc>() * 2
+}
+
+/// Allocate an MP bus ID without changing the original max+1 fast path.
+fn select_isa_bus_id(buses: &BTreeSet<u8>) -> Result<u8> {
+    // Root bus zero is inserted by setup_mptable before calling this helper.
+    let max_bus = *buses.iter().next_back().ok_or(Error::NoFreeIsaBusId)?;
+    match max_bus.checked_add(1) {
+        Some(id) => Ok(id),
+        None => (0..=u8::MAX)
+            .rev()
+            .find(|id| !buses.contains(id))
+            .ok_or(Error::NoFreeIsaBusId),
+    }
 }
 
 /// Performs setup of the MP table for the given `num_cpus`.
@@ -104,17 +127,37 @@ pub fn setup_mptable(
     // Used to keep track of the next base pointer into the MP table.
     let mut base_mp = GuestAddress(MPTABLE_START);
 
-    // Calculate ISA bus number in the system, report at least one PCI bus.
-    let isa_bus_id = match pci_irqs.iter().max_by_key(|v| v.0.bus) {
-        Some(pci_irq) => pci_irq.0.bus + 1,
-        _ => 1,
-    };
-    let mp_size = compute_mp_size(num_cpus);
+    // Keep the original source of bus information: PCI interrupt routes.
+    // Bus zero is always reported, even when there are no PCI interrupt routes.
+    let mut buses: BTreeSet<u8> = pci_irqs.iter().map(|irq| irq.0.bus).collect();
+    buses.insert(0);
+    // Preserve the original max+1 policy. Only scan when max is ff.
+    let isa_bus_id = select_isa_bus_id(&buses)?;
+    // Use the same IRQ range for sizing and emission; avoid truncation to u8.
+    let starting_isa_irq_num = pci_irqs
+        .iter()
+        .map(|(_, irq, _)| u64::from(*irq) + 1)
+        .fold(u64::from(super::X86_64_IRQ_BASE), u64::max);
+    let isa_irq_count = 16u64.saturating_sub(starting_isa_irq_num) as usize;
+    let mp_size = compute_mp_size(num_cpus, buses.len(), pci_irqs.len(), isa_irq_count);
+    base::debug!(
+        "MP table: cpus={}, pci_buses={:?}, isa_bus_id={}, start={:#x}, size={}, capacity={}",
+        num_cpus,
+        buses,
+        isa_bus_id,
+        MPTABLE_START,
+        mp_size,
+        MPTABLE_END - MPTABLE_START
+    );
 
     // The checked_add here ensures the all of the following base_mp.unchecked_add's will be without
     // overflow.
     if let Some(end_mp) = base_mp.checked_add(mp_size as u64 - 1) {
-        if !mem.address_in_range(end_mp) {
+        if end_mp.offset() >= MPTABLE_END || !mem.address_in_range(end_mp) {
+            base::error!(
+                "MP table does not fit original low-memory range: start={:#x}, size={}, end_limit={:#x}",
+                MPTABLE_START, mp_size, MPTABLE_END
+            );
             return Err(Error::NotEnoughMemory);
         }
     } else {
@@ -144,7 +187,7 @@ pub fn setup_mptable(
     base_mp = base_mp.unchecked_add(mem::size_of::<mpc_table>() as u64);
 
     let mut checksum: u8 = 0;
-    let ioapicid: u8 = num_cpus + 1;
+    let ioapicid = num_cpus.checked_add(1).ok_or(Error::AddressOverflow)?;
 
     for cpu_id in 0..num_cpus {
         let size = mem::size_of::<mpc_cpu>();
@@ -181,7 +224,7 @@ pub fn setup_mptable(
         base_mp = base_mp.unchecked_add(size as u64);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic));
     }
-    for pci_bus_id in 0..isa_bus_id {
+    for pci_bus_id in buses {
         let size = mem::size_of::<mpc_bus>();
         let mpc_bus = mpc_bus {
             type_: MP_BUS as u8,
@@ -277,11 +320,6 @@ pub fn setup_mptable(
         checksum = checksum.wrapping_add(compute_checksum(&mpc_intsrc));
     }
 
-    let starting_isa_irq_num = pci_irqs
-        .iter()
-        .map(|(_, irq_num, _)| irq_num + 1)
-        .fold(super::X86_64_IRQ_BASE, u32::max) as u8;
-
     // Finally insert ISA interrupts.
     for i in starting_isa_irq_num..16 {
         let size = mem::size_of::<mpc_intsrc>();
@@ -290,9 +328,9 @@ pub fn setup_mptable(
             irqtype: mp_irq_source_types_mp_INT as u8,
             irqflag: MP_IRQDIR_DEFAULT as u16,
             srcbus: isa_bus_id,
-            srcbusirq: i,
+            srcbusirq: i as u8,
             dstapic: ioapicid,
-            dstirq: i,
+            dstirq: i as u8,
         };
         mem.write_obj_at_addr(mpc_intsrc, base_mp)
             .map_err(|_| Error::WriteMpcIntsrc)?;
@@ -361,7 +399,7 @@ mod tests {
     use super::*;
 
     fn compute_page_aligned_mp_size(num_cpus: u8) -> u64 {
-        let mp_size = compute_mp_size(num_cpus);
+        let mp_size = compute_mp_size(num_cpus, 1, 0, 7);
         let pg_size = pagesize();
         (mp_size + pg_size - (mp_size % pg_size)) as u64
     }
@@ -387,6 +425,129 @@ mod tests {
         .unwrap();
 
         setup_mptable(&mem, num_cpus, &[]).unwrap();
+    }
+
+    #[test]
+    fn sparse_bus_policy_and_original_layout() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0xa0000)]).unwrap();
+        for (route_buses, expected_isa) in [
+            (vec![0, 0x80, 0xe5, 0xe5], 0xe6),
+            (vec![0, 0x80, 0xfe, 0xff], 0xfd),
+        ] {
+            let irqs: Vec<_> = route_buses
+                .iter()
+                .map(|bus| {
+                    (
+                        PciAddress::new(0, u32::from(*bus), 1, 0).unwrap(),
+                        10,
+                        PciInterruptPin::IntA,
+                    )
+                })
+                .collect();
+            for cpus in [1, 2] {
+                setup_mptable(&mem, cpus, &irqs).unwrap();
+                let mpf: mpf_intel = mem.read_obj_from_addr(GuestAddress(MPTABLE_START)).unwrap();
+                assert_eq!(
+                    mpf.physptr as u64,
+                    MPTABLE_START + mem::size_of::<mpf_intel>() as u64
+                );
+                assert_eq!(mpf_intel_compute_checksum(&mpf), mpf.checksum);
+                let base = GuestAddress(u64::from(mpf.physptr));
+                let header: mpc_table = mem.read_obj_from_addr(base).unwrap();
+                let end = base.unchecked_add(u64::from(header.length));
+                assert!(end.offset() <= MPTABLE_END);
+                let mut bytes = vec![0; header.length as usize];
+                mem.read_at_addr(&mut bytes, base).unwrap();
+                assert_eq!(
+                    bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+                    0
+                );
+                let mut cursor = base.unchecked_add(mem::size_of::<mpc_table>() as u64);
+                let mut pci_ids = Vec::new();
+                let mut isa = None;
+                while cursor < end {
+                    let kind: u8 = mem.read_obj_from_addr(cursor).unwrap();
+                    if kind == MP_BUS as u8 {
+                        let bus: mpc_bus = mem.read_obj_from_addr(cursor).unwrap();
+                        if bus.bustype == BUS_TYPE_PCI {
+                            pci_ids.push(bus.busid);
+                        } else {
+                            assert_eq!(bus.bustype, BUS_TYPE_ISA);
+                            isa = Some(bus.busid);
+                        }
+                    } else if kind == MP_INTSRC as u8 {
+                        let irq: mpc_intsrc = mem.read_obj_from_addr(cursor).unwrap();
+                        assert!(irq.srcbus == expected_isa || route_buses.contains(&irq.srcbus));
+                    } else if kind == MP_LINTSRC as u8 {
+                        let irq: mpc_lintsrc = mem.read_obj_from_addr(cursor).unwrap();
+                        assert_eq!(irq.srcbusid, expected_isa);
+                    }
+                    cursor = cursor.unchecked_add(table_entry_size(kind) as u64);
+                }
+                let expected: BTreeSet<u8> = route_buses.iter().copied().collect();
+                assert_eq!(pci_ids, expected.into_iter().collect::<Vec<_>>());
+                assert_eq!(isa, Some(expected_isa));
+                assert_eq!(cursor, end);
+                let expected_size = compute_mp_size(cpus, pci_ids.len(), irqs.len(), 5);
+                assert_eq!(
+                    mem::size_of::<mpf_intel>() + header.length as usize,
+                    expected_size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_bus_ids_used_is_explicit_error() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0xa0000)]).unwrap();
+        let irqs: Vec<_> = (0..=u8::MAX)
+            .map(|bus| {
+                (
+                    PciAddress::new(0, u32::from(bus), 1, 0).unwrap(),
+                    10,
+                    PciInterruptPin::IntA,
+                )
+            })
+            .collect();
+        assert!(matches!(
+            setup_mptable(&mem, 2, &irqs),
+            Err(Error::NoFreeIsaBusId)
+        ));
+    }
+
+    #[test]
+    fn isa_id_uses_max_plus_one_or_highest_hole() {
+        let buses: BTreeSet<u8> = [0, 0x80, 0xe5].iter().copied().collect();
+        assert_eq!(select_isa_bus_id(&buses).unwrap(), 0xe6);
+        for hole in [1, 127, 254, 255] {
+            let buses: BTreeSet<u8> = (0..=u8::MAX).filter(|id| *id != hole).collect();
+            assert_eq!(select_isa_bus_id(&buses).unwrap(), hole);
+        }
+    }
+
+    #[test]
+    fn oversized_table_does_not_write_guest_memory() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0xa0000)]).unwrap();
+        mem.write_obj_at_addr(0xa5u8, GuestAddress(MPTABLE_START))
+            .unwrap();
+        let irqs: Vec<_> = (0..=254u8)
+            .map(|bus| {
+                (
+                    PciAddress::new(0, u32::from(bus), 1, 0).unwrap(),
+                    10,
+                    PciInterruptPin::IntA,
+                )
+            })
+            .collect();
+        assert!(matches!(
+            setup_mptable(&mem, 2, &irqs),
+            Err(Error::NotEnoughMemory)
+        ));
+        assert_eq!(
+            mem.read_obj_from_addr::<u8>(GuestAddress(MPTABLE_START))
+                .unwrap(),
+            0xa5
+        );
     }
 
     #[test]
@@ -448,6 +609,13 @@ mod tests {
         .unwrap();
 
         for i in 0..MAX_CPUS {
+            if compute_mp_size(i, 1, 0, 7) > (MPTABLE_END - MPTABLE_START) as usize {
+                assert!(matches!(
+                    setup_mptable(&mem, i, &[]),
+                    Err(Error::NotEnoughMemory)
+                ));
+                continue;
+            }
             setup_mptable(&mem, i, &[]).unwrap();
 
             let mpf_intel: mpf_intel = mem.read_obj_from_addr(GuestAddress(MPTABLE_START)).unwrap();

@@ -363,6 +363,8 @@ struct E820Entry {
 const KB: u64 = 1 << 10;
 const MB: u64 = 1 << 20;
 const GB: u64 = 1 << 30;
+// Exclusive end of conventional low RAM; the reserved/BIOS area starts here.
+pub(crate) const LOW_MEMORY_END: u64 = 640 * KB;
 
 pub const BOOT_STACK_POINTER: u64 = 0x8000;
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
@@ -828,7 +830,7 @@ pub fn arch_memory_regions(
     // 1 MB is reserved for device memory/ROMs and get confused if there is a RAM region
     // spanning this area, so we provide the traditional 640 KB low memory and 1 MB+
     // high memory regions.
-    let mem_below_1m = 640 * KB;
+    let mem_below_1m = LOW_MEMORY_END;
     regions.push((
         GuestAddress(0),
         mem_below_1m,
@@ -840,8 +842,8 @@ pub fn arch_memory_regions(
     // it should be reported as "reserved" in the e820 memory map to match PC architecture
     // expectations.
     regions.push((
-        GuestAddress(640 * KB),
-        (1 * MB) - (640 * KB),
+        GuestAddress(LOW_MEMORY_END),
+        (1 * MB) - LOW_MEMORY_END,
         MemoryRegionOptions::new().purpose(MemoryRegionPurpose::ReservedMemory),
     ));
 
