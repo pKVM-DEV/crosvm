@@ -72,6 +72,7 @@ pub struct PciBridge {
     bus_range: PciBridgeBusRange,
     msi_config: Arc<Mutex<MsiConfig>>,
     interrupt_evt: Option<IrqLevelEvent>,
+    hotplug_window_sizes: Option<(u64, u64)>,
 }
 
 impl PciBridge {
@@ -127,7 +128,13 @@ impl PciBridge {
             bus_range,
             msi_config,
             interrupt_evt: None,
+            hotplug_window_sizes: None,
         }
+    }
+
+    /// Reserve address space before boot for preconfigured hotplug BARs.
+    pub fn set_hotplug_window_sizes(&mut self, memory: u64, prefetchable: u64) {
+        self.hotplug_window_sizes = Some((memory, prefetchable));
     }
 
     fn write_bridge_window(
@@ -189,6 +196,7 @@ fn finalize_window(
     alloc: Alloc,
     mut base: u64,
     mut size: u64,
+    alignment: u64,
 ) -> std::result::Result<(u64, u64), PciDeviceError> {
     if size == 0 {
         // Allocate at least 2MB bridge winodw
@@ -206,7 +214,7 @@ fn finalize_window(
             "pci_bridge_window".to_string(),
             AllocOptions::new()
                 .prefetchable(prefetchable)
-                .align(BR_WINDOW_ALIGNMENT),
+                .align(alignment),
         ) {
             Ok(addr) => Ok((addr, size)),
             Err(e) => Err(PciDeviceError::PciBusWindowAllocationFailure(format!(
@@ -363,7 +371,9 @@ impl PciDevice for PciBridge {
             // it for guest OS use.
             // If bridge is hotplugged into the system, get the desired bridge window size
             // from host.
-            let (win_size, pref_win_size) = self.device.lock().get_bridge_window_size();
+            let (win_size, pref_win_size) = self
+                .hotplug_window_sizes
+                .unwrap_or_else(|| self.device.lock().get_bridge_window_size());
             window_size = win_size;
             pref_window_size = pref_win_size;
         } else {
@@ -406,6 +416,11 @@ impl PciDevice for PciBridge {
                 },
                 window_base,
                 window_size,
+                if self.hotplug_window_sizes.is_some() {
+                    window_size.next_power_of_two()
+                } else {
+                    BR_WINDOW_ALIGNMENT
+                },
             )?;
             window_base = window.0;
             window_size = window.1;
@@ -420,6 +435,11 @@ impl PciDevice for PciBridge {
                 },
                 pref_window_base,
                 pref_window_size,
+                if self.hotplug_window_sizes.is_some() {
+                    pref_window_size.next_power_of_two()
+                } else {
+                    BR_WINDOW_ALIGNMENT
+                },
             ) {
                 Ok(pref_window) => {
                     pref_window_base = pref_window.0;
