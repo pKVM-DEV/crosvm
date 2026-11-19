@@ -1703,7 +1703,7 @@ pub fn create_vfio_device(
                 vfio_device_tube_msix,
                 VmMemoryClient::new(vfio_device_tube_mem),
                 vfio_device_tube_vm,
-                protection_type.isolates_memory() && !hotplug,
+                protection_type.isolates_memory(),
             )?;
             // early reservation for pass-through PCI devices.
             let endpoint_addr = vfio_pci_device
